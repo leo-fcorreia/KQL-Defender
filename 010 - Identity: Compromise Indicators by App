@@ -1,129 +1,70 @@
-let TimeRange                  = 30d;
-let MinAttempts                = 30;   // mínimo por conta (total, não por linha)
-let BurstWindow                = 1h;   // janela para burst detection
-let LegitSuccessThreshold      = 100;
+let TimeRange = 30d;
+let MinAttempts = 30;
+let LegitSuccessThreshold = 100;
 let LegitDistinctUsersThreshold = 20;
-// Exclude your Public IP Addresses
 let ExcludedCidrs = dynamic([
-    "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/29"
+    "xxx.xxx.xxx.xxx/30",  "yyy.yyy.yyy.yyy/30"
 ]);
-// ── LegitIPs: idêntico ao seu original ──────────────────────────────────────
 let LegitIPs = AADSignInEventsBeta
-    | where Timestamp > ago(TimeRange)
-    | where ErrorCode == 0
-    | where isnotempty(AccountUpn)
-    | where isnotempty(IPAddress)
-    | where LogonType has "InteractiveUser"
-    | summarize
-        SuccessCountByIP    = count(),
-        SuccessfulUsersByIP = dcount(AccountUpn)
-        by IPAddress
-    | where SuccessCountByIP    >  LegitSuccessThreshold
-    | where SuccessfulUsersByIP >= LegitDistinctUsersThreshold
-    | project IPAddress;
-// ── NOVO: total de tentativas por conta (para MinAttempts global) ─────────────
-// Resolve o caso onde a conta tem 29+29 em duas categorias mas nunca atinge 30
-// numa única linha do summarize original
-let TotalAttemptsPerAccount = AADSignInEventsBeta
-    | where Timestamp > ago(TimeRange)
-    | where ErrorCode != 0
-    | where isnotempty(AccountUpn)
-    | where isnotempty(IPAddress)
-    | where IsCompliant == 0
-    | where IsManaged   == 0
-    | where LogonType has "InteractiveUser"
-    | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
-    | where IPAddress !in (LegitIPs)
-    | extend AttackCategory = case(
-        ErrorCode in (50126, 50052),                                                "Password Spray / Brute Force",
-        ErrorCode == 50053,                                                         "Account Lockout (Brute Force)",
-        ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),     "MFA Challenge / MFA Attack",
-        ErrorCode in (700082, 700081, 70043, 50173),                                "Token Abuse / Session Hijack",
-        ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012,
-                      530022, 530002, 530004, 530003, 530032),                      "Conditional Access Block",
-        ErrorCode in (50020, 500011, 700016, 50105),                                "Account / App Enumeration",
-        "Other Authentication Failure"
-    )
-    | where AttackCategory != "Other Authentication Failure"
-        and AttackCategory != "Conditional Access Block"
-    | summarize TotalAttemptsAccount = count() by AccountUpn
-    | where TotalAttemptsAccount >= MinAttempts;
-// ── NOVO: burst detection — pico de tentativas em janela curta ───────────────
-let BurstPerAccount = AADSignInEventsBeta
-    | where Timestamp > ago(TimeRange)
-    | where ErrorCode != 0
-    | where isnotempty(AccountUpn)
-    | where isnotempty(IPAddress)
-    | where IsCompliant == 0
-    | where IsManaged   == 0
-    | where LogonType has "InteractiveUser"
-    | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
-    | where IPAddress !in (LegitIPs)
-    | summarize BurstCount = count()
-        by AccountUpn, bin(Timestamp, BurstWindow)
-    | summarize BurstMaxInWindow = max(BurstCount) by AccountUpn
-    // BurstFlag: true se o pico em 1h for ≥ 20% do MinAttempts
-    | extend BurstFlag = BurstMaxInWindow >= (MinAttempts * 0.2);
-// ── Query principal: idêntica ao seu original + joins dos dois blocos novos ──
+| where Timestamp > ago(TimeRange)
+| where ErrorCode == 0
+| where isnotempty(AccountUpn)
+| where isnotempty(IPAddress)
+| where LogonType has "InteractiveUser"
+| summarize
+    SuccessCountByIP = count(),
+    SuccessfulUsersByIP = dcount(AccountUpn)
+by IPAddress
+| where SuccessCountByIP > LegitSuccessThreshold
+| where SuccessfulUsersByIP >= LegitDistinctUsersThreshold
+| project IPAddress;
 AADSignInEventsBeta
 | where Timestamp > ago(TimeRange)
 | where ErrorCode != 0
 | where isnotempty(AccountUpn)
 | where isnotempty(IPAddress)
 | where IsCompliant == 0
-| where IsManaged   == 0
+| where IsManaged == 0
 | where LogonType has "InteractiveUser"
 | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
 | where IPAddress !in (LegitIPs)
 | extend AttackCategory = case(
-    ErrorCode in (50126, 50052),                                                "Password Spray / Brute Force",
-    ErrorCode == 50053,                                                         "Account Lockout (Brute Force)",
-    ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),     "MFA Challenge / MFA Attack",
-    ErrorCode in (700082, 700081, 70043, 50173),                                "Token Abuse / Session Hijack",
-    ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012,
-                  530022, 530002, 530004, 530003, 530032),                      "Conditional Access Block",
-    ErrorCode in (50020, 500011, 700016, 50105),                                "Account / App Enumeration",
+    ErrorCode in (50126, 50052), "Password Spray / Brute Force",
+    ErrorCode == 50053, "Account Lockout (Brute Force)",
+    ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121), "MFA Challenge / MFA Attack",
+    ErrorCode in (700082, 700081, 70043, 50173), "Token Abuse / Session Hijack",
+    ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012, 530022, 530002, 530004, 530003, 530032), "Conditional Access Block",
+    ErrorCode in (50020, 500011, 700016, 50105), "Account / App Enumeration",
     "Other Authentication Failure"
 )
-| where AttackCategory != "Other Authentication Failure"
-    and AttackCategory != "Conditional Access Block"
+| where AttackCategory != "Other Authentication Failure" and AttackCategory != "Conditional Access Block"
 | extend
-    ErrorCodeTxt  = tostring(ErrorCode),
-    CountryTxt    = tostring(Country),
-    AppTxt        = tostring(Application),
-    ClientAppTxt  = tostring(ClientAppUsed),
-    AppGroup      = iff(isempty(tostring(Application)), "Unknown", tostring(Application))
+    ErrorCodeTxt = tostring(ErrorCode),
+    CountryTxt = tostring(Country),
+    AppTxt = tostring(Application),
+    ClientAppTxt = tostring(ClientAppUsed),
+    AppGroup = iff(isempty(tostring(Application)), "Unknown", tostring(Application))
 | summarize
-    Attempts      = count(),
-    ErrorCodesArr = make_set_if(ErrorCodeTxt,  isnotempty(ErrorCodeTxt),  20),
-    CountriesArr  = make_set_if(CountryTxt,    isnotempty(CountryTxt),    10),
-    ClientAppsArr = make_set_if(ClientAppTxt,  isnotempty(ClientAppTxt),  10),
-    // MUDANÇA: limite explícito de 50 — sem limite explodia em contas muito atacadas
-    IPAddressesArr = make_set_if(IPAddress,    isnotempty(IPAddress),     50),
-    DistinctIPs   = dcount(IPAddress),
-    FirstSeen     = min(Timestamp),
-    LastSeen      = max(Timestamp),
-    MaxRiskLevel  = max(RiskLevelAggregated)
-    by AccountUpn, AttackCategory, AppGroup
-// MUDANÇA: filtra por total da conta, não por linha
-// (join com TotalAttemptsPerAccount que já filtrou MinAttempts no total)
-| join kind=inner TotalAttemptsPerAccount on AccountUpn
-| join kind=leftouter BurstPerAccount     on AccountUpn
+    Attempts = count(),
+    ErrorCodesArr = make_set_if(ErrorCodeTxt, isnotempty(ErrorCodeTxt), 20),
+    CountriesArr = make_set_if(CountryTxt, isnotempty(CountryTxt), 10),
+    ClientAppsArr = make_set_if(ClientAppTxt, isnotempty(ClientAppTxt), 10),
+    IPAddressesArr = make_set_if(IPAddress, isnotempty(IPAddress), 20),
+    DistinctIPs = dcount(IPAddress),
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    MaxRiskLevel = max(RiskLevelAggregated)
+by AccountUpn, AttackCategory, AppGroup
+| where Attempts >= MinAttempts
 | extend
-    ErrorCodes  = iff(array_length(ErrorCodesArr)  == 0, "-", strcat_array(ErrorCodesArr,  ", ")),
-    Countries   = iff(array_length(CountriesArr)   == 0, "-", strcat_array(CountriesArr,   ", ")),
-    ClientApps  = iff(array_length(ClientAppsArr)  == 0, "-", strcat_array(ClientAppsArr,  ", ")),
+    ErrorCodes = iff(array_length(ErrorCodesArr) == 0, "-", strcat_array(ErrorCodesArr, ", ")),
+    Countries = iff(array_length(CountriesArr) == 0, "-", strcat_array(CountriesArr, ", ")),
+    ClientApps = iff(array_length(ClientAppsArr) == 0, "-", strcat_array(ClientAppsArr, ", ")),
     IPAddresses = iff(array_length(IPAddressesArr) == 0, "-", strcat_array(IPAddressesArr, ", "))
-// MUDANÇA: AttackScore para priorização no Power BI
-// DistinctIPs pesa mais — diferencia spray real de erros repetidos
-| extend AttackScore =
-      Attempts               * 1
-    + DistinctIPs            * 5
-    + coalesce(BurstMaxInWindow, 0) * 3
 | project
     AccountUpn,
     AttackCategory,
-    Application   = AppGroup,
+    Application = AppGroup,
     Attempts,
     DistinctIPs,
     IPAddresses,
@@ -132,8 +73,6 @@ AADSignInEventsBeta
     ClientApps,
     FirstSeen,
     LastSeen,
-    MaxRiskLevel,
-    BurstMaxInWindow  = coalesce(BurstMaxInWindow, 0),
-    BurstFlag         = coalesce(BurstFlag, false),
-    AttackScore
-| order by AttackScore desc
+    MaxRiskLevel
+//| top 100 by Attempts desc
+| order by Attempts desc
