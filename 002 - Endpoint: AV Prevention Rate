@@ -1,0 +1,23 @@
+AlertInfo
+| where Timestamp > ago(30d)
+| where Category == "Malware"
+| join kind=inner (
+    AlertEvidence
+    | where FolderPath !contains "Commvault"
+    | summarize DeviceName = take_anyif(DeviceName, isnotempty(DeviceName)) by AlertId
+) on AlertId
+| extend IsDetection  = Title contains "detected"
+| extend IsPrevention = Title contains "prevented"
+| summarize
+    TotalDetections  = countif(IsDetection),
+    TotalPreventions = countif(IsPrevention),
+    TotalAlerts      = dcount(AlertId),
+    PersistentCount  = dcountif(AlertId,
+        Title contains "detected"
+    )
+| extend
+    AVPreventRate    = round(100.0 * TotalPreventions / (TotalDetections + TotalPreventions), 1),
+    PersistentRate   = round(100.0 * PersistentCount  / TotalAlerts, 1)
+| project
+    TotalAlerts, TotalDetections, TotalPreventions,
+    AVPreventRate, PersistentCount, PersistentRate
