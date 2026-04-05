@@ -1,0 +1,42 @@
+let TimeRange                   = 30d;
+let MinAttempts                 = 30;
+let LegitSuccessThreshold       = 100;
+let LegitDistinctUsersThreshold = 20;
+// Exclude your Public IP Addresses
+let ExcludedCidrs = dynamic([
+    "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/29"
+]);
+let LegitIPs = AADSignInEventsBeta
+    | where Timestamp > ago(TimeRange)
+    | where ErrorCode == 0
+    | where isnotempty(IPAddress)
+    | where LogonType has "InteractiveUser"
+    | summarize c = count(), u = dcount(AccountUpn) by IPAddress
+    | where c > LegitSuccessThreshold and u >= LegitDistinctUsersThreshold
+    | project IPAddress;
+AADSignInEventsBeta
+| where Timestamp > ago(TimeRange)
+| where ErrorCode != 0
+| where isnotempty(AccountUpn)
+| where isnotempty(IPAddress)
+| where IsCompliant == 0 and IsManaged == 0
+| where LogonType has "InteractiveUser"
+| where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
+| where IPAddress !in (LegitIPs)
+| extend AttackCategory = case(
+    ErrorCode in (50126, 50052),                                                "Password Spray / Brute Force",
+    ErrorCode == 50053,                                                         "Account Lockout (Brute Force)",
+    ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),     "MFA Challenge / MFA Attack",
+    ErrorCode in (700082, 700081, 70043, 50173),                                "Token Abuse / Session Hijack",
+    ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012,
+                  530022, 530002, 530004, 530003, 530032),                      "Conditional Access Block",
+    ErrorCode in (50020, 500011, 700016, 50105),                                "Account / App Enumeration",
+    "Other"
+)
+| where AttackCategory != "Other" and AttackCategory != "Conditional Access Block"
+| summarize TotalAttempts = count() by AccountUpn
+| where TotalAttempts >= MinAttempts
+| summarize
+    AccountsUnderAttack = count(),
+    TotalAttempts       = sum(TotalAttempts),
+    AvgAttemptsPerAccount = round(avg(TotalAttempts), 1)
