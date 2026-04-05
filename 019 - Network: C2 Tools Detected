@@ -1,0 +1,14 @@
+let RMMSoftware = externaldata(RMMSoftware: string)[@"https://raw.githubusercontent.com/leo-fcorreia/threat-hunting/refs/heads/main/RMM%20Tools%20for%20C2"] with (format="csv", ignoreFirstRecord=True);
+let ExclDevices = datatable(excludeddev :string)  // Add as many devices you would like to exclude
+ ["DeviceName1",
+  "DeviceName2",
+  "DeviceName3"];
+let ExclVendor = datatable(excludevendor :string)  // Add as many vendors you would like to exclude
+ ["Legitimate-C2-App"];
+let Timeframe = 30d; // Choose the best timeframe for your investigation
+DeviceProcessEvents
+    | where Timestamp > ago(Timeframe)
+    | where ProcessVersionInfoCompanyName has_any (RMMSoftware)
+    | where not(DeviceName in (['ExclDevices']))
+    | where not(ProcessVersionInfoCompanyName in (['ExclVendor']))
+    | summarize by DeviceName, FileName, FolderPath, ProcessVersionInfoCompanyName, ProcessVersionInfoProductName
