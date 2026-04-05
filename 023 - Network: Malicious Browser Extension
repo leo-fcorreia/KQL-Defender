@@ -1,0 +1,30 @@
+let MaliciousExtensionList = datatable(TargetExtensionID: string)
+    ['BrowserExtensionID1', 'BrowserExtensionID2'];  // ← adicione IDs conhecidos
+let MaliciousBrowserExtensions = externaldata(
+    ['Extension ID']: string,
+    ['Extension Name']: string
+)
+[@'https://raw.githubusercontent.com/leo-fcorreia/threat-hunting/refs/heads/main/Suspicious-Browser-Extensions.csv']
+with (format='csv', ignoreFirstRecord=True);
+DeviceFileEvents
+| where Timestamp > ago(30d)
+| where FolderPath has_any (@'\AppData\Local')
+| where FolderPath has 'Extensions'
+| extend DetectedID = extract(@'\\Extensions\\([a-p]{32})', 1, FolderPath)
+| where DetectedID in~ (MaliciousExtensionList)
+    or DetectedID in~ (MaliciousBrowserExtensions)
+| lookup kind=leftouter MaliciousBrowserExtensions
+    on $left.DetectedID == $right.['Extension ID']
+| summarize
+    FirstDetected = min(Timestamp),
+    LastDetected  = max(Timestamp),
+    DeviceCount   = dcount(DeviceName),
+    SamplePath    = any(FolderPath),
+    ExtensionName = any(['Extension Name'])
+    by DetectedID, DeviceName, InitiatingProcessAccountName
+| project
+    FirstDetected, LastDetected, DeviceName,
+    DetectedID,
+    ExtensionName = iff(isempty(ExtensionName), 'Unknown Extension Name', ExtensionName),
+    InitiatingProcessAccountName, SamplePath
+| order by LastDetected desc
