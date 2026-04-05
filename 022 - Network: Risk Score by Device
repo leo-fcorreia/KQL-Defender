@@ -1,0 +1,75 @@
+let lb = ago(30d);
+let HighRiskPorts = dynamic([3389,1433,3306,5432,27017,5985,5986,9200,6379]);
+let PortExposure =
+    DeviceNetworkEvents
+    | where Timestamp > lb
+    | where ActionType == 'InboundConnectionAccepted'
+    | where RemoteIPType == 'Public'
+    | where LocalPort in (HighRiskPorts)
+    | extend PortWeight = case(
+        LocalPort == 3389,                              50,
+        LocalPort in (1433,3306,5432,27017,9200,6379),  40,
+        LocalPort in (5985,5986),                       35,
+        20
+    )
+    | summarize
+        ExposedPorts  = dcount(LocalPort),
+        MaxPortRisk   = max(PortWeight),
+        UniqueExtIPs  = dcount(RemoteIP),
+        ServiceList   = make_set(tostring(LocalPort))
+        by DeviceId, DeviceName;
+let RMMSoftware = externaldata(RMMSoftware: string)
+    [@'https://raw.githubusercontent.com/leo-fcorreia/threat-hunting/refs/heads/main/RMM%20Tools%20for%20C2']
+    with (format='csv', ignoreFirstRecord=True);
+let ExclVendor = datatable(excludevendor :string)  // Add as many vendors you would like to exclude
+ ["Specific-App-Name1"];
+let C2Tools =
+    DeviceProcessEvents
+    | where Timestamp > lb
+    | where ProcessVersionInfoCompanyName has_any (RMMSoftware)
+    | where not(ProcessVersionInfoCompanyName in (['ExclVendor']))
+    | summarize
+        C2Count = count(),
+        C2Tools = make_set(ProcessVersionInfoProductName, 5)
+        by DeviceId;
+let AuditClears =
+    DeviceProcessEvents
+    | where Timestamp > lb
+    | where FileName =~ 'wevtutil.exe'
+    | where ProcessCommandLine has_any ('cl ', 'clear-log')
+    | where ProcessCommandLine !contains "Specific-App-Name2"
+    | summarize AuditClearCount = count() by DeviceId;
+let OpenShares =
+    DeviceTvmSecureConfigurationAssessment
+    | where Timestamp > lb
+    | where ConfigurationId has 'scid-4001'
+    | where IsCompliant == '0'
+    | summarize OpenShareCount = count() by DeviceId;
+DeviceInfo
+| where Timestamp > lb
+| summarize arg_max(Timestamp, DeviceName, OSPlatform, ExposureLevel) by DeviceId
+| join kind=leftouter PortExposure on DeviceId
+| join kind=leftouter C2Tools      on DeviceId
+| join kind=leftouter AuditClears  on DeviceId
+| join kind=leftouter OpenShares   on DeviceId
+| extend
+    S_Port   = coalesce(MaxPortRisk,      0),
+    S_C2     = iff(coalesce(C2Count,        0) > 0, 50, 0),
+    S_Audit  = iff(coalesce(AuditClearCount, 0) > 0, 60, 0),
+    S_Shares = iff(coalesce(OpenShareCount,  0) > 0, 20, 0),
+    S_Exp    = case(ExposureLevel == 'High', 20, ExposureLevel == 'Medium', 10, 0)
+| extend
+    NetworkRiskScore = S_Port + S_C2 + S_Audit + S_Shares + S_Exp,
+    RiskRating = case(
+        S_Port + S_C2 + S_Audit + S_Shares + S_Exp >= 80, 'CRITICAL',
+        S_Port + S_C2 + S_Audit + S_Shares + S_Exp >= 40, 'HIGH',
+        S_Port + S_C2 + S_Audit + S_Shares + S_Exp > 0,   'MEDIUM',
+        'LOW'
+    )
+| where NetworkRiskScore > 0
+| project
+    DeviceName, OSPlatform, ExposureLevel, RiskRating, NetworkRiskScore,
+    S_Port, S_C2, S_Audit, S_Shares,
+    ExposedPorts, UniqueExtIPs, ServiceList,
+    C2Count, C2Tools, AuditClearCount, OpenShareCount
+| order by NetworkRiskScore desc
