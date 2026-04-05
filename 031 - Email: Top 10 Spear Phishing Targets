@@ -1,0 +1,19 @@
+let PhishAlerts = AlertInfo
+    | where Timestamp > ago(30d)
+    | where AttackTechniques contains 'Spearphishing'
+    // SEPARAÇÃO: exclui reportes manuais do usuário
+    | where Title !contains "Email reported by user"
+    | extend TechJSON = parse_json(AttackTechniques)
+    | mv-expand TechJSON
+    | project AlertId, Technique = tostring(TechJSON);
+AlertEvidence
+    | where Timestamp > ago(30d)
+    | where isnotempty(AccountName)
+    | join kind=inner PhishAlerts on AlertId
+    | summarize
+        AlertCount    = dcount(AlertId),
+        TechSet       = make_set(Technique)
+        by AccountName
+    | top 10 by AlertCount
+    | extend TechniquesList = strcat_array(TechSet, ', ')
+    | project AccountName, AlertCount, TechniquesList
