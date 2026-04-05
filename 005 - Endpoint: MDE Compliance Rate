@@ -1,0 +1,31 @@
+let lookback = 30d;
+DeviceTvmSecureConfigurationAssessment
+| where Timestamp > ago(lookback)
+| where ConfigurationId in (
+    'scid-91','scid-2000','scid-2001','scid-2002','scid-2003',
+    'scid-2010','scid-2011','scid-2012','scid-2014','scid-2016'
+)
+| where OSPlatform !in ('iOS','macOS')
+| extend Result = case(
+    IsApplicable == 0, 'N/A',
+    IsCompliant  == 1, 'GOOD',
+    'BAD'
+)
+| summarize
+    GoodCount = countif(Result == 'GOOD'),
+    BadCount  = countif(Result == 'BAD')
+    by DeviceId
+| extend
+    OverallCompliance = iif(GoodCount == 10 and BadCount == 0, 'YES', 'NO'),
+    ComplianceScore   = round(100.0 * GoodCount / 10.0, 0)
+| summarize
+    TotalDevices      = count(),
+    CompliantDevices  = countif(OverallCompliance == 'YES'),
+    AvgComplianceScore= round(avg(ComplianceScore), 1),
+    DevicesTamperBad  = countif(BadCount > 0),
+    DevicesSensorBad  = countif(GoodCount < 10)
+| extend
+    ComplianceRate    = round(100.0 * CompliantDevices / TotalDevices, 1)
+| project
+    TotalDevices, CompliantDevices, ComplianceRate,
+    AvgComplianceScore, DevicesTamperBad
