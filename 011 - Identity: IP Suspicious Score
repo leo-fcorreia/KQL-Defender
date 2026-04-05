@@ -1,0 +1,195 @@
+let TimeRange             = 30d;
+let MinAttempts           = 3;
+let MinDistinctAccounts   = 3;
+// PRECISÃO 3: filtro de app como parâmetro — deixe dynamic([]) para ver todas
+// ou liste as apps que quer focar:
+// dynamic(["Azure Active Directory PowerShell", "Microsoft Azure PowerShell",
+//          "Microsoft Azure CLI", "Office365 Shell WCSS-Client"])
+let AppFilter = dynamic([
+    "Azure Active Directory PowerShell",
+    "Microsoft Azure PowerShell",
+    "Microsoft Azure CLI",
+    "Office365 Shell WCSS-Client"
+]);
+// Exclude your Public IP Addresses
+let ExcludedCidrs = dynamic([
+    "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/29"
+]);
+// ── LegitIPs: idêntico ao seu original ──────────────────────────────────────
+let LegitIPs = AADSignInEventsBeta
+    | where Timestamp > ago(TimeRange)
+    | where ErrorCode == 0
+    | where isnotempty(AccountUpn)
+    | where isnotempty(IPAddress)
+    | where LogonType has "InteractiveUser"
+    | summarize
+        SuccessCountByIP    = count(),
+        SuccessfulUsersByIP = dcount(AccountUpn)
+        by IPAddress
+    | where SuccessCountByIP    > 100
+    | where SuccessfulUsersByIP >= 20
+    | project IPAddress;
+// ── BaseEvents: idêntico ao seu original + BUG 2 corrigido ──────────────────
+let BaseEvents = AADSignInEventsBeta
+    | where Timestamp > ago(TimeRange)
+    | where isnotempty(AccountUpn)
+    | where isnotempty(IPAddress)
+    | where LogonType has "InteractiveUser"
+    | where IsCompliant == 0
+    | where IsManaged   == 0
+    | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
+    // BUG 2 CORRIGIDO: LegitIPs agora realmente aplicado
+    | where IPAddress !in (LegitIPs)
+    | extend AttackCategory = case(
+        ErrorCode in (50126, 50052),                                                "Password Spray / Brute Force",
+        ErrorCode == 50053,                                                         "Account Lockout (Brute Force)",
+        ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),     "MFA Challenge / MFA Attack",
+        ErrorCode in (700082, 700081, 70043, 50173),                                "Token Abuse / Session Hijack",
+        ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012,
+                      530022, 530002, 530004, 530003, 530032),                      "Conditional Access Block",
+        ErrorCode in (50020, 500011, 700016, 50105),                                "Account / App Enumeration",
+        ErrorCode == 0,                                                             "Successful Sign-in",
+        "Other Authentication Failure"
+    )
+    | extend
+        ErrorCodeTxtRaw = trim(" ", tostring(ErrorCode)),
+        CountryTxtRaw   = trim(" ", tostring(Country)),
+        AppTxtRaw       = trim(" ", tostring(Application)),
+        ClientAppTxtRaw = trim(" ", tostring(ClientAppUsed))
+    | extend
+        ErrorCodeTxt  = trim(" ", replace_regex(ErrorCodeTxtRaw,  @"[\[\]""]", "")),
+        CountryTxt    = trim(" ", replace_regex(CountryTxtRaw,    @"[\[\]""]", "")),
+        AppTxt        = trim(" ", replace_regex(AppTxtRaw,        @"[\[\]""]", "")),
+        ClientAppTxt  = trim(" ", replace_regex(ClientAppTxtRaw,  @"[\[\]""]", ""))
+    | extend
+        CountryGroup    = iff(isempty(CountryTxt),    "Unknown", CountryTxt),
+        AppGroup        = iff(isempty(AppTxt),        "Unknown", AppTxt),
+        ClientAppGroup  = iff(isempty(ClientAppTxt),  "Unknown", ClientAppTxt);
+// ── FailureEvents: idêntico ao seu original ──────────────────────────────────
+let FailureEvents = BaseEvents
+    | where ErrorCode != 0
+    | where AttackCategory != "Other Authentication Failure";
+// ── SuccessEvents: PRECISÃO 2 corrigida ──────────────────────────────────────
+// ORIGINAL usava BaseEvents sem filtrar AttackCategory != "CA Block" etc.
+// Agora filtra apenas sucessos reais (ErrorCode == 0) dentro dos mesmos
+// critérios de IP do FailureEvents — ExcludedCidrs e LegitIPs já aplicados
+// em BaseEvents, então não há trabalho extra aqui
+let SuccessEvents = BaseEvents
+    | where ErrorCode == 0
+    | project
+        SuccessTimestamp      = Timestamp,
+        SuccessIP             = IPAddress,
+        SuccessAccountUpn     = AccountUpn,
+        SuccessAppGroup       = AppGroup,
+        SuccessClientAppGroup = ClientAppGroup;
+// ── Query principal ──────────────────────────────────────────────────────────
+FailureEvents
+| summarize
+    Attempts                = count(),
+    DistinctAccounts        = dcount(AccountUpn),
+    TargetedAccountsArr     = make_set(AccountUpn,      50),
+    ErrorCodesArr           = make_set_if(ErrorCodeTxt,    ErrorCodeTxt    != "", 20),
+    CountriesArr            = make_set_if(CountryGroup,    CountryGroup    != "", 10),
+    ClientAppsArr           = make_set_if(ClientAppGroup,  ClientAppGroup  != "", 10),
+    ApplicationsArr         = make_set_if(AppGroup,        AppGroup        != "", 10),
+    FirstSeen               = min(Timestamp),
+    LastSeen                = max(Timestamp),
+    MaxRiskLevel            = max(RiskLevelAggregated),
+    PasswordSprayAttempts   = countif(AttackCategory == "Password Spray / Brute Force"),
+    MfaAttackAttempts       = countif(AttackCategory == "MFA Challenge / MFA Attack"),
+    TokenAbuseAttempts      = countif(AttackCategory == "Token Abuse / Session Hijack"),
+    EnumerationAttempts     = countif(AttackCategory == "Account / App Enumeration"),
+    // ConditionalAccessBlocks mantido como campo informativo
+    // mas REMOVIDO do SuspicionScore (PRECISÃO 4: sempre seria 0 pois CA Block foi filtrado)
+    ConditionalAccessBlocks = countif(AttackCategory == "Conditional Access Block"),
+    LockoutAttempts         = countif(AttackCategory == "Account Lockout (Brute Force)")
+    by IPAddress, AttackCategory, AppGroup, ClientAppGroup
+| where Attempts         >= MinAttempts
+| where DistinctAccounts >= MinDistinctAccounts
+| join kind=leftouter (
+    SuccessEvents
+    | summarize
+        SuccessCount          = count(),
+        SuccessfulAccountsArr = make_set(SuccessAccountUpn, 30),
+        FirstSuccess          = min(SuccessTimestamp),
+        LastSuccess           = max(SuccessTimestamp)
+        by SuccessIP, SuccessAppGroup, SuccessClientAppGroup
+) on $left.IPAddress        == $right.SuccessIP
+   and $left.AppGroup       == $right.SuccessAppGroup
+   and $left.ClientAppGroup == $right.SuccessClientAppGroup
+| extend
+    SuccessCountFinal       = coalesce(SuccessCount, 0),
+    SuccessfulAccountsFinal = iff(isnull(SuccessfulAccountsArr), dynamic([]), SuccessfulAccountsArr)
+// PRECISÃO 1 CORRIGIDA: LastSuccess > LastSeen (após o fim do ataque)
+// ORIGINAL usava LastSuccess >= FirstSeen → qualquer sucesso nos 30d contava,
+// inclusive logins legítimos anteriores ao ataque
+| extend
+    SuccessAfterFailures = iff(
+        SuccessCountFinal > 0 and LastSuccess > LastSeen,
+        true, false
+    )
+// BUG 1 CORRIGIDO: ordem dos argumentos invertida
+// ORIGINAL: datetime_diff("minute", FirstSeen, LastSeen) → retorna negativo
+// CORRETO:  datetime_diff("minute", LastSeen, FirstSeen) → retorna positivo
+| extend
+    AttackWindowMinutes = datetime_diff("minute", LastSeen, FirstSeen)
+| extend
+    AttackWindowMinutes = iff(AttackWindowMinutes < 0, 0, AttackWindowMinutes)
+| extend
+    AttemptsPerHour = round(
+        Attempts / iff(AttackWindowMinutes <= 0, 1.0, todouble(AttackWindowMinutes) / 60.0),
+        2
+    )
+| extend
+    SuspicionScore =
+          iff(DistinctAccounts >= 10, 30, iff(DistinctAccounts >= 5, 20, 10))
+        + iff(Attempts >= 100, 25, iff(Attempts >= 50, 15, 5))
+        + iff(PasswordSprayAttempts > 0, 20, 0)
+        + iff(MfaAttackAttempts     > 0, 15, 0)
+        + iff(TokenAbuseAttempts    > 0, 15, 0)
+        + iff(EnumerationAttempts   > 0, 10, 0)
+        // PRECISÃO 4: ConditionalAccessBlocks removido do score (sempre 0 após o filtro)
+        + iff(LockoutAttempts       > 0, 10, 0)
+        + iff(MaxRiskLevel >= 100, 15, iff(MaxRiskLevel >= 50, 8, 0))
+        + iff(SuccessAfterFailures, 25, 0)
+| extend
+    Severity = case(
+        SuspicionScore >= 90, "Critical",
+        SuspicionScore >= 70, "High",
+        SuspicionScore >= 45, "Medium",
+        "Low"
+    )
+| extend
+    ErrorCodes         = iff(array_length(ErrorCodesArr)           == 0, "-", strcat_array(ErrorCodesArr,           ", ")),
+    Countries          = iff(array_length(CountriesArr)            == 0, "-", strcat_array(CountriesArr,            ", ")),
+    ClientApps         = iff(array_length(ClientAppsArr)           == 0, "-", strcat_array(ClientAppsArr,           ", ")),
+    Applications       = iff(array_length(ApplicationsArr)         == 0, "-", strcat_array(ApplicationsArr,         ", ")),
+    TargetedAccounts   = iff(array_length(TargetedAccountsArr)     == 0, "-", strcat_array(TargetedAccountsArr,     ", ")),
+    SuccessfulAccounts = iff(array_length(SuccessfulAccountsFinal)  == 0, "-", strcat_array(SuccessfulAccountsFinal, ", "))
+| project
+    Severity,
+    SuspicionScore,
+    IPAddress,
+    AttackCategory,
+    Application   = AppGroup,
+    ClientApp     = ClientAppGroup,
+    Attempts,
+    AttemptsPerHour,
+    DistinctAccounts,
+    TargetedAccounts,
+    SuccessAfterFailures,
+    SuccessCount  = SuccessCountFinal,
+    SuccessfulAccounts,
+    ErrorCodes,
+    Countries,
+    FirstSeen,
+    LastSeen,
+    FirstSuccess,
+    LastSuccess,
+    MaxRiskLevel
+// PRECISÃO 3: filtro de app via parâmetro AppFilter
+// Se AppFilter estiver vazio, retorna todas as apps
+| where array_length(AppFilter) == 0
+    or Application has_any (AppFilter)
+| order by SuspicionScore desc, Attempts desc, DistinctAccounts desc
+//| top 100 by SuspicionScore desc
