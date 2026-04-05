@@ -1,0 +1,21 @@
+AlertInfo
+| where Timestamp > ago(30d)
+| where isnotempty(AttackTechniques)
+| extend TechArr = parse_json(AttackTechniques)
+| mv-expand Technique = TechArr
+| extend TechniqueId = tostring(Technique)
+| summarize
+    AlertCount      = dcount(AlertId),
+    CriticalCount   = countif(Severity == 'Critical'),
+    HighCount       = countif(Severity == 'High'),
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp)
+    by TechniqueId, Category
+| extend HeatIntensity = case(
+    AlertCount >= 20, 4,
+    AlertCount >= 10, 3,
+    AlertCount >= 5,  2,
+    AlertCount >= 1,  1,
+    0
+)
+| order by AlertCount desc
