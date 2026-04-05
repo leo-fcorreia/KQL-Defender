@@ -1,0 +1,125 @@
+// ════════════════════════════════════════════════════════════════════════════════
+// PHISHING — Filtro por Técnica MITRE + Título + Categoria
+// Versão corrigida — contains em vez de has, filtro de fonte removido
+// ════════════════════════════════════════════════════════════════════════════════
+let TimeRange = 30d;
+// ── Alertas de phishing — captura por técnica MITRE OU por título ─────────────
+// CORREÇÃO: removido filtro de ServiceSource — alertas como "Suspicious URL clicked"
+// podem vir do MDE (device) e não apenas do MDO (email)
+// CORREÇÃO: contains em vez de has — has exige word boundary e falha com
+// títulos que têm aspas, caracteres especiais ou variações de texto
+let PhishingAlerts = AlertInfo
+    | where Timestamp > ago(TimeRange)
+    | where
+        // Por técnica MITRE
+        AttackTechniques has_any ("T1566", "T1534")
+        // Por título — contains é case-insensitive e não exige word boundary
+        or Title contains "Email messages removed after delivery"
+        or Title contains "malicious URL removed after delivery"
+        or Title contains "Email reported by user"
+        or Title contains "CustomEnterpriseBlockOnly"
+        or Title contains "Phishing document"
+        or Title contains "MalUri"
+        or Title contains "Suspicious email sending patterns"
+        or Title contains "quarantined by ZAP"
+        or Title contains "subsequently quarantined"
+        or Title contains "Suspicious URL clicked"
+    // ── Técnica MITRE: verifica substrings em ordem do mais específico ────────
+    // T1566.001 e T1566.002 antes de T1566 — evita T1566 engolir as subtécnicas
+    | extend MITRETechnique = case(
+        AttackTechniques contains "T1534",     "Internal Spearphishing (T1534)",
+        AttackTechniques contains "T1566.001", "Spearphishing Attachment (T1566.001)",
+        AttackTechniques contains "T1566.002", "Spearphishing Link (T1566.002)",
+        AttackTechniques contains "T1566",     "Phishing (T1566)",
+        "No MITRE Technique"
+    )
+    // ── Categoria pelo título — contains resolve variações de texto ───────────
+    | extend AlertCategory = case(
+        Title contains "Email reported by user",               "User Awareness",
+        Title contains "malicious URL removed after delivery", "Post-Delivery Action",
+        Title contains "removed after delivery",               "Post-Delivery Action",
+        Title contains "CustomEnterpriseBlockOnly",            "Policy Block",
+        Title contains "MalUri",                               "Policy Block",
+        Title contains "Phishing document",                    "Malicious Content",
+        Title contains "Suspicious email sending patterns",    "Sender Anomaly",
+        Title contains "quarantined by ZAP",                   "User Exposure",
+        Title contains "subsequently quarantined",              "User Exposure",
+        Title contains "Suspicious URL clicked",                "User Exposure",
+        // Alertas capturados por MITRE mas sem título mapeado
+        MITRETechnique != "No MITRE Technique",                "Phishing Detection",
+        "Other Phishing"
+    )
+    // ── Tipo de alerta ────────────────────────────────────────────────────────
+    | extend AlertType = case(
+        Title contains "Email reported by user",             "User Report",
+        Title contains "removed after delivery",             "Automated Removal",
+        Title contains "CustomEnterpriseBlockOnly",           "Automated Block",
+        Title contains "MalUri",                             "Automated Block",
+        Title contains "Suspicious email sending patterns",  "Behavioral",
+        Title contains "quarantined by ZAP",                  "Post-Click Risk",
+        Title contains "subsequently quarantined",             "Post-Click Risk",
+        Title contains "Suspicious URL clicked",               "Post-Click Risk",
+        Title contains "Phishing document",                  "Payload Detected",
+        "Detection"
+    )
+    | extend IsUserAction   = AlertCategory == "User Awareness"
+    | extend IsUserExposure = AlertCategory == "User Exposure"
+    | extend IsPostDelivery = AlertCategory in ("Post-Delivery Action", "User Exposure")
+    | project
+        Timestamp,
+        AlertId,
+        Title,
+        Severity,
+        Category,
+        ServiceSource,
+        MITRETechnique,
+        AlertCategory,
+        AlertType,
+        IsUserAction,
+        IsUserExposure,
+        IsPostDelivery,
+        AttackTechniques;
+// ── Evidência de contas afetadas ──────────────────────────────────────────────
+let AccountEvidence = AlertEvidence
+    | where Timestamp > ago(TimeRange)
+    | where isnotempty(AccountName)
+    | summarize
+        AccountCount = dcount(AccountName),
+        AccountsArr  = make_set(AccountName, 50)
+        by AlertId;
+// ── Evidência de dispositivos afetados ───────────────────────────────────────
+let DeviceEvidence = AlertEvidence
+    | where Timestamp > ago(TimeRange)
+    | where isnotempty(DeviceName)
+    | summarize
+        DeviceCount = dcount(DeviceName),
+        DevicesArr  = make_set(DeviceName, 50)
+        by AlertId;
+// ── Resultado principal ───────────────────────────────────────────────────────
+PhishingAlerts
+| join kind=leftouter AccountEvidence on AlertId
+| join kind=leftouter DeviceEvidence  on AlertId
+| extend
+    AffectedAccounts = iff(array_length(AccountsArr) == 0, "-", strcat_array(AccountsArr, ", ")),
+    AffectedDevices  = iff(array_length(DevicesArr)  == 0, "-", strcat_array(DevicesArr,  ", ")),
+    AccountCount     = coalesce(AccountCount, 0),
+    DeviceCount      = coalesce(DeviceCount,  0)
+| project
+    MITRETechnique,
+    AlertCategory,
+    AlertType,
+    IsUserAction,
+    IsUserExposure,
+    IsPostDelivery,
+    Timestamp,
+    AlertId,
+    Title,
+    Severity,
+    ServiceSource,
+    AccountCount,
+    AffectedAccounts,
+    DeviceCount,
+    AffectedDevices
+| order by IsUserExposure desc, IsPostDelivery desc, Severity asc, Timestamp desc
+
+
