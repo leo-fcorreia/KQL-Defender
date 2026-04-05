@@ -1,0 +1,9 @@
+AlertInfo
+| where Timestamp > ago(30d)
+| summarize
+    CriticalCount = countif(Severity == 'Critical'),
+    HighCount     = countif(Severity == 'High'),
+    MediumCount   = countif(Severity == 'Medium'),
+    LowCount      = countif(Severity == 'Low'),
+    TotalCount    = count()
+    by Week = startofweek(Timestamp), Severity
