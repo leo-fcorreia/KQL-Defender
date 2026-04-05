@@ -4,7 +4,7 @@ let LegitSuccessThreshold = 100;
 let LegitDistinctUsersThreshold = 20;
 let ExcludedCidrs = dynamic([
     "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/30"
-]);
+    ]);
 let LegitIPs = AADSignInEventsBeta
 | where Timestamp > ago(TimeRange)
 | where ErrorCode == 0
