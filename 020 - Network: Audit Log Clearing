@@ -1,0 +1,7 @@
+DeviceProcessEvents
+| where Timestamp > ago(30d)
+| where FileName =~ "wevtutil.exe"
+| where ProcessCommandLine has_any ("cl ", "clear-log")
+| where ProcessCommandLine !contains "Specific-App-Name"
+| project Timestamp, DeviceName, InitiatingProcessAccountName, ProcessCommandLine
+| extend Status = "CRITICAL: Audit Log Cleared"
