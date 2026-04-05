@@ -1,0 +1,100 @@
+let TimeRange             = 30d;
+let MinAttempts           = 3;
+let MinDistinctAccounts   = 3;
+// Exclude your Public IP Addresses
+let ExcludedCidrs = dynamic([
+    "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/29"
+]);
+let LegitIPs = AADSignInEventsBeta
+    | where Timestamp > ago(TimeRange)
+    | where ErrorCode == 0
+    | where isnotempty(IPAddress)
+    | where LogonType has "InteractiveUser"
+    | summarize c = count(), u = dcount(AccountUpn) by IPAddress
+    | where c > 100 and u >= 20
+    | project IPAddress;
+let BaseEvents = AADSignInEventsBeta
+    | where Timestamp > ago(TimeRange)
+    | where isnotempty(AccountUpn) and isnotempty(IPAddress)
+    | where LogonType has "InteractiveUser"
+    | where IsCompliant == 0 and IsManaged == 0
+    | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
+    | where IPAddress !in (LegitIPs)
+    | extend AttackCategory = case(
+        ErrorCode in (50126, 50052),                                                "Password Spray / Brute Force",
+        ErrorCode == 50053,                                                         "Account Lockout (Brute Force)",
+        ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),     "MFA Challenge / MFA Attack",
+        ErrorCode in (700082, 700081, 70043, 50173),                                "Token Abuse / Session Hijack",
+        ErrorCode in (50020, 500011, 700016, 50105),                                "Account / App Enumeration",
+        ErrorCode == 0,                                                             "Successful Sign-in",
+        "Other"
+    )
+    | extend
+        AppTxt       = trim(" ", replace_regex(trim(" ", tostring(Application)),  @"[\[\]""]", "")),
+        ClientAppTxt = trim(" ", replace_regex(trim(" ", tostring(ClientAppUsed)),@"[\[\]""]", ""))
+    | extend
+        AppGroup       = iff(isempty(AppTxt),       "Unknown", AppTxt),
+        ClientAppGroup = iff(isempty(ClientAppTxt), "Unknown", ClientAppTxt);
+let FailureEvents = BaseEvents
+    | where ErrorCode != 0
+    | where AttackCategory != "Other";
+let SuccessEvents = BaseEvents
+    | where ErrorCode == 0
+    | project SuccessTimestamp = Timestamp, SuccessIP = IPAddress,
+              SuccessAccountUpn = AccountUpn,
+              SuccessAppGroup = AppGroup, SuccessClientAppGroup = ClientAppGroup;
+FailureEvents
+| summarize
+    Attempts              = count(),
+    DistinctAccounts      = dcount(AccountUpn),
+    FirstSeen             = min(Timestamp),
+    LastSeen              = max(Timestamp),
+    MaxRiskLevel          = max(RiskLevelAggregated),
+    PasswordSprayAttempts = countif(AttackCategory == "Password Spray / Brute Force"),
+    MfaAttackAttempts     = countif(AttackCategory == "MFA Challenge / MFA Attack"),
+    TokenAbuseAttempts    = countif(AttackCategory == "Token Abuse / Session Hijack"),
+    EnumerationAttempts   = countif(AttackCategory == "Account / App Enumeration"),
+    LockoutAttempts       = countif(AttackCategory == "Account Lockout (Brute Force)")
+    by IPAddress, AttackCategory, AppGroup, ClientAppGroup
+| where Attempts >= MinAttempts and DistinctAccounts >= MinDistinctAccounts
+| join kind=leftouter (
+    SuccessEvents
+    | summarize
+        SuccessCount  = count(),
+        FirstSuccess  = min(SuccessTimestamp),
+        LastSuccess   = max(SuccessTimestamp)
+        by SuccessIP, SuccessAppGroup, SuccessClientAppGroup
+) on $left.IPAddress == $right.SuccessIP
+   and $left.AppGroup == $right.SuccessAppGroup
+   and $left.ClientAppGroup == $right.SuccessClientAppGroup
+| extend
+    SuccessCountFinal    = coalesce(SuccessCount, 0),
+    SuccessAfterFailures = iff(coalesce(SuccessCount, 0) > 0 and coalesce(LastSuccess, datetime(null)) > LastSeen, true, false),
+    AttackWindowMinutes  = datetime_diff("minute", LastSeen, FirstSeen)
+| extend
+    AttemptsPerHour = round(
+        Attempts / iff(AttackWindowMinutes <= 0, 1.0, todouble(AttackWindowMinutes) / 60.0), 2
+    )
+| extend SuspicionScore =
+      iff(DistinctAccounts >= 10, 30, iff(DistinctAccounts >= 5, 20, 10))
+    + iff(Attempts >= 100, 25, iff(Attempts >= 50, 15, 5))
+    + iff(PasswordSprayAttempts > 0, 20, 0)
+    + iff(MfaAttackAttempts     > 0, 15, 0)
+    + iff(TokenAbuseAttempts    > 0, 15, 0)
+    + iff(EnumerationAttempts   > 0, 10, 0)
+    + iff(LockoutAttempts       > 0, 10, 0)
+    + iff(MaxRiskLevel >= 100, 15, iff(MaxRiskLevel >= 50, 8, 0))
+    + iff(SuccessAfterFailures, 25, 0)
+| extend Severity = case(
+    SuspicionScore >= 90, "Critical",
+    SuspicionScore >= 70, "High",
+    SuspicionScore >= 45, "Medium",
+    "Low"
+)
+// KPI: contagem por Severity para o Card e distribuição
+| summarize
+    CriticalIPs = countif(Severity == "Critical"),
+    HighIPs     = countif(Severity == "High"),
+    MediumIPs   = countif(Severity == "Medium"),
+    LowIPs      = countif(Severity == "Low"),
+    TotalIPs    = count()
