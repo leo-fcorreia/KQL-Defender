@@ -1,0 +1,14 @@
+DeviceTvmSecureConfigurationAssessment
+| where Timestamp > ago(30d)
+| where ConfigurationId == 'scid-2010'
+| where isnotnull(Context)
+| extend avdata = parse_json(Context)
+| extend AVMode = case(
+    tostring(avdata[0][0]) == '0', 'Active',
+    tostring(avdata[0][0]) == '1', 'Passive',
+    tostring(avdata[0][0]) == '4', 'EDR Blocked',
+    'Unknown'
+)
+| where OSPlatform !in ('iOS','macOS')
+| summarize DeviceCount = dcount(DeviceId) by AVMode, OSPlatform
+| order by DeviceCount desc
