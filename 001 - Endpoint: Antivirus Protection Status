@@ -46,16 +46,24 @@ AlertInfo
     Detections == 0 and Preventions > 0, "Prevented",
     "Other"
 )
-// KPIs derivados direto nesta query
-| extend DwellTime_hrs = round(
-    todouble(datetime_diff('minute', LastSeen, FirstSeen)) / 60.0, 1
-)
-| extend AVPreventRate = round(
-    100.0 * Preventions / (Detections + Preventions), 1
-)
 | project
-    DeviceName, FileName, FolderPath, SHA1, SHA256,
-    MalwareName, TotalAlerts, Detections, Preventions,
-    FirstSeen, LastSeen, DwellTime_hrs, AVPreventRate,
-    MaxSeverity, ProtectionStatus, AlertTitles
+    DeviceName,
+    FileName,
+    FolderPath,
+    SHA1,
+    SHA256,
+    MalwareName,
+    TotalAlerts,
+    AlertIds,
+    Detections,
+    Preventions,
+    FirstSeen,
+    LastSeen,
+    FirstDetectionSeen,
+    LastDetectionSeen,
+    FirstPreventionSeen,
+    LastPreventionSeen,
+    MaxSeverity,
+    ProtectionStatus,
+    AlertTitles
 | order by LastSeen desc
