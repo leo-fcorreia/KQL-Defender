@@ -1,0 +1,22 @@
+let PhishGeneral = AlertInfo
+    | where Timestamp > ago(30d)
+    | where AttackTechniques contains 'phish'
+    | where not(AttackTechniques contains 'Spearphishing')
+    | where Title !contains "Email reported by user"
+    | summarize PhishCount = dcount(AlertId)
+        by Week = startofweek(Timestamp);
+let PhishSpear = AlertInfo
+    | where Timestamp > ago(30d)
+    | where AttackTechniques contains 'Spearphishing'
+    | where Title !contains "Email reported by user"
+    | summarize SpearCount = dcount(AlertId)
+        by Week = startofweek(Timestamp);
+PhishGeneral
+    | join kind=fullouter PhishSpear on Week
+    | extend
+        PhishCount = coalesce(PhishCount, 0),
+        SpearCount = coalesce(SpearCount, 0),
+        Week       = coalesce(Week, Week1)
+    | extend PhishType = iff(SpearCount > 0, 'Mixed', 'General Only')
+    | project Week, PhishCount, SpearCount, PhishType
+    | order by Week asc
