@@ -1,0 +1,19 @@
+DeviceTvmSecureConfigurationAssessment
+| where Timestamp > ago(30d)
+| where ConfigurationId == 'scid-2011'
+| where isnotnull(Context)
+| extend avdata = parse_json(Context)
+| extend
+    AVSigVersion        = tostring(avdata[0][0]),
+    AVEngineVersion     = tostring(avdata[0][1]),
+    AVSigLastUpdateTime = todatetime(tostring(avdata[0][2])),
+    AVProductVersion    = tostring(avdata[0][3])
+| where isnotempty(AVSigLastUpdateTime)
+| extend SigAge_days = datetime_diff('day', now(), AVSigLastUpdateTime)
+| where OSPlatform !in ('iOS','macOS')
+| project
+    DeviceName, OSPlatform, AVSigVersion,
+    AVEngineVersion, AVSigLastUpdateTime,
+    SigAge_days,
+    SigStatus = iff(SigAge_days <= 1, 'OK', iff(SigAge_days <= 3, 'WARNING', 'OUTDATED'))
+| order by SigAge_days desc
