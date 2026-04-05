@@ -1,0 +1,24 @@
+AlertInfo
+| where Timestamp > ago(30d)
+| where Category == "Malware"
+| join kind=inner (
+    AlertEvidence
+    | where FolderPath !contains "Commvault"
+    | summarize DeviceName = take_anyif(DeviceName, isnotempty(DeviceName)) by AlertId
+) on AlertId
+| extend IsDetection  = Title contains "detected"
+| extend IsPrevention = Title contains "prevented"
+| summarize
+    FirstSeen = minif(Timestamp, IsDetection or IsPrevention),
+    LastSeen  = maxif(Timestamp, IsDetection or IsPrevention)
+    by DeviceName
+| where isnotempty(FirstSeen) and isnotempty(LastSeen)
+| extend DwellTime_hrs = round(
+    todouble(datetime_diff('minute', LastSeen, FirstSeen)) / 60.0, 1
+)
+| summarize
+    AvgDwellTime_hrs    = round(avg(DwellTime_hrs), 1),
+    MedianDwellTime_hrs = round(percentile(DwellTime_hrs, 50), 1),
+    P95DwellTime_hrs    = round(percentile(DwellTime_hrs, 95), 1),
+    MaxDwellTime_hrs    = round(max(DwellTime_hrs), 1),
+    DevicesAbove4h      = countif(DwellTime_hrs > 4)
