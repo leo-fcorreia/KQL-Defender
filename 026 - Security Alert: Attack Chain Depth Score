@@ -1,0 +1,58 @@
+let lb = ago(30d);
+let AlertDetails =
+    AlertInfo
+    | where Timestamp > lb
+    | where isnotempty(AttackTechniques)
+    | extend TechArr   = parse_json(AttackTechniques)
+    | extend TechCount = array_length(TechArr)
+    | extend SevWeight = case(
+        Severity == 'Critical', 4,
+        Severity == 'High',     3,
+        Severity == 'Medium',   2,
+        1
+    )
+    | project AlertId, Timestamp, Title, Severity, Category,
+        MITRE_Techniques = tostring(AttackTechniques),
+        TechCount, SevWeight, ServiceSource;
+let DevEvidence =
+    AlertEvidence
+    | where isnotempty(DeviceName)
+    | summarize
+        DevicesArr  = make_set(DeviceName, 10),
+        DeviceCount = dcount(DeviceName)
+        by AlertId;
+let AccEvidence =
+    AlertEvidence
+    | where isnotempty(AccountName)
+    | summarize
+        AccountsArr  = make_set(AccountName, 10),
+        AccountCount = dcount(AccountName)
+        by AlertId;
+AlertDetails
+| join kind=leftouter DevEvidence on AlertId
+| join kind=leftouter AccEvidence on AlertId
+| extend
+    DeviceCount  = iif(isnotnull(DeviceCount),  DeviceCount,  0),
+    AccountCount = iif(isnotnull(AccountCount), AccountCount, 0)
+| extend AttackChainScore =
+    TechCount    * 5
+    + DeviceCount  * 3
+    + AccountCount * 3
+    + SevWeight    * 4
+| summarize
+    AlertCount        = count(),
+    MaxChainScore     = max(AttackChainScore),
+    AvgChainScore     = round(avg(AttackChainScore), 1),
+    TotalTechniques   = sum(TechCount),
+    MaxDeviceSpread   = max(DeviceCount),
+    MaxAccountSpread  = max(AccountCount),
+    ServiceSources    = make_set(ServiceSource)
+    by Category
+| extend ThreatLevel = case(
+    MaxChainScore >= 60, 'CRITICAL - IMMEDIATE RESPONSE',
+    MaxChainScore >= 30, 'HIGH - INVESTIGATE',
+    MaxChainScore >= 10, 'MEDIUM - MONITOR',
+    'LOW - MONITOR'
+)
+| order by MaxChainScore desc
+
