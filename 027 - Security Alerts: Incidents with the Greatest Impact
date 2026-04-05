@@ -1,0 +1,32 @@
+let AlertDetails = AlertInfo
+| where Timestamp > ago(30d)
+| where Severity in ('Critical', 'High')
+| project AlertId, Timestamp, Title, Severity, Category,
+    MITRE_Techniques = tostring(AttackTechniques), ServiceSource;
+let DeviceEvidence = AlertEvidence
+| where isnotempty(DeviceName)
+| summarize
+    DevicesArr  = make_set(DeviceName),
+    DeviceCount = dcount(DeviceName)
+    by AlertId;
+let AccountEvidence = AlertEvidence
+| where isnotempty(AccountName)
+| summarize
+    AccountsArr  = make_set(AccountName),
+    AccountCount = dcount(AccountName)
+    by AlertId;
+AlertDetails
+| join kind=leftouter DeviceEvidence  on AlertId
+| join kind=leftouter AccountEvidence on AlertId
+| extend
+    DeviceCount  = coalesce(DeviceCount,  0),
+    AccountCount = coalesce(AccountCount, 0),
+    BlastRadius  = coalesce(DeviceCount,  0) + coalesce(AccountCount, 0)
+| where BlastRadius > 1
+| project
+    Timestamp, AlertId, Title, Severity, Category,
+    MITRE_Techniques, ServiceSource,
+    DeviceCount, AccountCount, BlastRadius,
+    AffectedDevices  = strcat_array(DevicesArr,  ', '),
+    AffectedAccounts = strcat_array(AccountsArr, ', ')
+| order by BlastRadius desc, Severity asc
