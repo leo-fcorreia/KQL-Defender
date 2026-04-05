@@ -1,0 +1,61 @@
+AlertInfo
+| where Timestamp > ago(30d)
+| where Category == "Malware"
+| join kind=inner (
+    AlertEvidence
+    | where FolderPath !contains "Commvault"
+    | summarize
+        SHA1       = take_anyif(SHA1,       isnotempty(SHA1)),
+        SHA256     = take_anyif(SHA256,     isnotempty(SHA256)),
+        DeviceName = take_anyif(DeviceName, isnotempty(DeviceName)),
+        FileName   = take_anyif(FileName,   isnotempty(FileName)),
+        FolderPath = take_anyif(FolderPath, isnotempty(FolderPath))
+    by AlertId
+) on AlertId
+| extend IsDetection  = Title contains "detected"
+| extend IsPrevention = Title contains "prevented"
+| summarize
+    AlertIds            = make_set(AlertId, 50),
+    TotalAlerts         = dcount(AlertId),
+    Detections          = countif(IsDetection),
+    Preventions         = countif(IsPrevention),
+    FirstDetectionSeen  = minif(Timestamp, IsDetection),
+    LastDetectionSeen   = maxif(Timestamp, IsDetection),
+    FirstPreventionSeen = minif(Timestamp, IsPrevention),
+    LastPreventionSeen  = maxif(Timestamp, IsPrevention),
+    MaxSeverity         = max(Severity),
+    AlertTitles_Raw     = make_set(Title, 50)
+    by DeviceName, SHA256, SHA1, FileName, FolderPath
+| extend AlertTitles  = tostring(AlertTitles_Raw)
+| extend MalwareName  = extract('\x27(.*?)\x27', 1, AlertTitles)
+| extend FirstSeen = case(
+    Detections  > 0, FirstDetectionSeen,
+    Preventions > 0, FirstPreventionSeen,
+    datetime(null)
+)
+| extend LastSeen = case(
+    Detections > 0 and Preventions > 0,
+        iif(LastPreventionSeen > LastDetectionSeen, LastPreventionSeen, LastDetectionSeen),
+    Detections > 0 and Preventions == 0, LastDetectionSeen,
+    Detections == 0 and Preventions > 0, LastPreventionSeen,
+    datetime(null)
+)
+| extend ProtectionStatus = case(
+    Detections > 0 and Preventions > 0 and LastPreventionSeen > LastDetectionSeen, "Remediated",
+    Detections > 0 and (Preventions == 0 or LastPreventionSeen <= LastDetectionSeen), "Persistent Threat",
+    Detections == 0 and Preventions > 0, "Prevented",
+    "Other"
+)
+// KPIs derivados direto nesta query
+| extend DwellTime_hrs = round(
+    todouble(datetime_diff('minute', LastSeen, FirstSeen)) / 60.0, 1
+)
+| extend AVPreventRate = round(
+    100.0 * Preventions / (Detections + Preventions), 1
+)
+| project
+    DeviceName, FileName, FolderPath, SHA1, SHA256,
+    MalwareName, TotalAlerts, Detections, Preventions,
+    FirstSeen, LastSeen, DwellTime_hrs, AVPreventRate,
+    MaxSeverity, ProtectionStatus, AlertTitles
+| order by LastSeen desc
