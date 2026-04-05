@@ -1,116 +1,64 @@
-let TimeRange             = 30d;
-let BurstWindow           = 1h;
-let MinAttempts           = 30;
-let MinDistinctIPs        = 2;
+let TimeRange = 30d;
+let MinAttempts = 30;
 let LegitSuccessThreshold = 100;
-let LegitDistinctUsers    = 20;
-// Exclude your public IP addresses
+let LegitDistinctUsersThreshold = 20;
 let ExcludedCidrs = dynamic([
     "xxx.xxx.xxx.xxx/22",  "yyy.yyy.yyy.yyy/30"
 ]);
-// ── BLOCO 1: IPs com histórico legítimo sólido ───────────────────────────────
 let LegitIPs = AADSignInEventsBeta
-    | where Timestamp > ago(TimeRange)
-    | where ErrorCode == 0
-    | where isnotempty(IPAddress)
-    | where LogonType has "InteractiveUser"
-    | project IPAddress, AccountUpn
-    | summarize
-        SuccessCount  = count(),
-        DistinctUsers = dcount(AccountUpn)
-        by IPAddress
-    | where SuccessCount  > LegitSuccessThreshold
-        and DistinctUsers >= LegitDistinctUsers
-    | project IPAddress;
-// ── BLOCO 2: Eventos de falha filtrados e materializados ─────────────────────
-// Todos os filtros aplicados uma única vez — blocos abaixo reutilizam este set
-let FailedSignins = AADSignInEventsBeta
-    | where Timestamp > ago(TimeRange)
-    | where ErrorCode != 0
-    | where isnotempty(AccountUpn)
-    | where isnotempty(IPAddress)
-    | where IsCompliant == 0
-    | where IsManaged   == 0
-    | where LogonType has "InteractiveUser"
-    | where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
-    | where IPAddress !in (LegitIPs)
-    | extend AttackCategory = case(
-        ErrorCode in (50126, 50052),
-            "Password Spray / Brute Force",
-        ErrorCode == 50053,
-            "Account Lockout (Brute Force)",
-        ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),
-            "MFA Challenge / MFA Attack",
-        ErrorCode in (700082, 700081, 70043, 50173),
-            "Token Abuse / Session Hijack",
-        ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012,
-                      530022, 530002, 530004, 530003, 530032),
-            "Conditional Access Block",
-        ErrorCode in (50020, 500011, 700016, 50105),
-            "Account / App Enumeration",
-        "Other"
-    )
-    | where AttackCategory != "Other"
-        and AttackCategory != "Conditional Access Block"
-    | extend AppNormalized = case(
-        isnotempty(tostring(Application)),
-            tostring(Application),
-        ErrorCode in (50126, 50052, 50053),
-            "Unknown App — Credential Attack",
-        ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121),
-            "Unknown App — MFA Attack",
-        "Unknown App — Other"
-    )
-    | project Timestamp, AccountUpn, IPAddress,
-              AttackCategory, AppNormalized, Country;
-// ── BLOCO 3: Burst — pico de tentativas em janela curta ──────────────────────
-let BurstPerAccount = FailedSignins
-    | summarize BurstCount = count()
-        by AccountUpn, bin(Timestamp, BurstWindow)
-    | summarize BurstMaxInWindow = max(BurstCount)
-        by AccountUpn;
-// ── BLOCO 4: DistinctIPs real — dcount direto, sem overlap entre categorias ──
-let DistinctIPsPerAccount = FailedSignins
-    | summarize DistinctIPs = dcount(IPAddress)
-        by AccountUpn;
-// ── BLOCO 5: Agregação principal — um summarize limpo, sem aninhamento ────────
-// Countries, AttackCategory e AppNormalized são todos strings simples
-// make_set de string → strcat_array funciona sem erro semântico
-FailedSignins
+| where Timestamp > ago(TimeRange)
+| where ErrorCode == 0
+| where isnotempty(AccountUpn)
+| where isnotempty(IPAddress)
+| where LogonType has "InteractiveUser"
 | summarize
-    TotalAttempts    = count(),
-    CategoriesList   = make_set(AttackCategory),   // make_set(string) — OK
-    AppsList         = make_set(AppNormalized),     // make_set(string) — OK
-    AllCountries     = make_set(Country, 30)        // make_set(string) — OK
-    by AccountUpn
-| where TotalAttempts >= MinAttempts
-| extend
-    AttackCategories = strcat_array(CategoriesList, " | "),
-    AppsTargeted     = strcat_array(AppsList,       " | "),
-    Countries        = strcat_array(AllCountries,   ", ")
-// Join com DistinctIPs correto (sem overlap entre categorias)
-| join kind=leftouter DistinctIPsPerAccount on AccountUpn
-| join kind=leftouter BurstPerAccount       on AccountUpn
-| where DistinctIPs >= MinDistinctIPs
-| extend AttackScore =
-      TotalAttempts            * 1
-    + DistinctIPs              * 5
-    + coalesce(BurstMaxInWindow, 0) * 3
-| extend AttackClassification = case(
-    DistinctIPs >= 10 and TotalAttempts >= 100, "High Confidence Attack",
-    DistinctIPs >= 5  and TotalAttempts >= 30,  "Medium Confidence Attack",
-    DistinctIPs >= 2  and TotalAttempts >= 30,  "Low Confidence / Suspicious",
-    "Noise"
+    SuccessCountByIP = count(),
+    SuccessfulUsersByIP = dcount(AccountUpn)
+by IPAddress
+| where SuccessCountByIP > LegitSuccessThreshold
+| where SuccessfulUsersByIP >= LegitDistinctUsersThreshold
+| project IPAddress;
+AADSignInEventsBeta
+| where Timestamp > ago(TimeRange)
+| where ErrorCode != 0
+| where isnotempty(AccountUpn)
+| where isnotempty(IPAddress)
+| where IsCompliant == 0
+| where IsManaged == 0
+| where LogonType has "InteractiveUser"
+| where not(ipv4_is_in_any_range(IPAddress, ExcludedCidrs))
+| where IPAddress !in (LegitIPs)
+| extend AttackCategory = case(
+    ErrorCode in (50126, 50052), "Password Spray / Brute Force",
+    ErrorCode == 50053, "Account Lockout (Brute Force)",
+    ErrorCode in (50076, 50078, 50079, 50178, 50181, 50184, 50177, 500121), "MFA Challenge / MFA Attack",
+    ErrorCode in (700082, 700081, 70043, 50173), "Token Abuse / Session Hijack",
+    ErrorCode in (53003, 53001, 53005, 53009, 53011, 53012, 530022, 530002, 530004, 530003, 530032), "Conditional Access Block",
+    ErrorCode in (50020, 500011, 700016, 50105), "Account / App Enumeration",
+    "Other Authentication Failure"
 )
-| where AttackClassification != "Noise"
+| where AttackCategory != "Other Authentication Failure" and AttackCategory != "Conditional Access Block"
+| extend AppGroup = iff(isempty(tostring(Application)), "Unknown", tostring(Application))
+// Primeiro summarize para limpar os dados brutos
+| summarize 
+    AttemptsRaw = count(), 
+    DistinctIPsRaw = dcount(IPAddress) 
+    by AccountUpn, AttackCategory, AppGroup
+// Segundo summarize para consolidar TUDO por AccountUpn
+| summarize
+    TotalAttempts = sum(AttemptsRaw),
+    TotalDistinctIPs = sum(DistinctIPsRaw),
+    CategoriesList = make_set(AttackCategory),
+    ApplicationsList = make_set(AppGroup)
+by AccountUpn
+| where TotalAttempts >= MinAttempts
+| extend 
+    AttackCategory = strcat_array(CategoriesList, ", "),
+    Application = strcat_array(ApplicationsList, ", ")
 | project
     AccountUpn,
-    AttackCategories,
-    AppsTargeted,
-    Countries,
-    Attempts             = TotalAttempts,
-    DistinctIPs,
-    BurstMaxInWindow     = coalesce(BurstMaxInWindow, 0),
-    AttackScore,
-    AttackClassification
-| order by AttackScore desc
+    AttackCategory,
+    Application,
+    Attempts = TotalAttempts,
+    DistinctIPs = TotalDistinctIPs
+| order by Attempts desc
