@@ -1,16 +1,12 @@
-let TimeRange        = 30d;
-let MinSeconds       = 3;    // mínimo para leitura humana do aviso
-let MaxSeconds       = 180;  // máximo — acima disso é cache ou re-trigger
-// Flags que indicam processo sem janela visível ao usuário
+let TimeRange       = 30d;
+let MinSeconds      = 3;
+let MaxSeconds      = 180;
 let AutomatedFlags = dynamic([
     "--restore-last-session",
     "--no-startup-window",
     "--headless",
     "--background-app"
 ]);
-// ── BLOCO 1: ActivityIds que cobrem exatamente 1 warning ─────────────────────
-// Um override humano dispara 1 UserOverride para 1 warning.
-// Se o mesmo ActivityId aparece em múltiplos warnings = automático.
 let SingleUseActivityIds = DeviceEvents
     | where Timestamp > ago(TimeRange)
     | where ActionType in ("SmartScreenUrlWarning", "SmartScreenAppWarning")
@@ -19,8 +15,6 @@ let SingleUseActivityIds = DeviceEvents
     | summarize WarningCount = count() by DeviceName, ActivityId
     | where WarningCount == 1
     | project DeviceName, ActivityId;
-// ── BLOCO 2: Overrides válidos ────────────────────────────────────────────────
-// Apenas overrides cujo ActivityId é de uso único (critério 5)
 let ValidOverrides = DeviceEvents
     | where Timestamp > ago(TimeRange)
     | where ActionType == "SmartScreenUserOverride"
@@ -31,11 +25,8 @@ let ValidOverrides = DeviceEvents
         DeviceName,
         ActivityId,
         OverrideTimestamp   = Timestamp,
-        // Conta que executou o clique de bypass
         OverrideAccountName = tolower(InitiatingProcessAccountName),
-        OverrideProcess     = InitiatingProcessFileName,
-        OverrideCmdLine     = InitiatingProcessCommandLine;
-// ── BLOCO 3: Warnings com filtro de sessão automática (critério 4) ────────────
+        OverrideProcess     = InitiatingProcessFileName;
 let Warnings = DeviceEvents
     | where Timestamp > ago(TimeRange)
     | where ActionType in ("SmartScreenUrlWarning", "SmartScreenAppWarning")
@@ -47,7 +38,7 @@ let Warnings = DeviceEvents
     | project
         Timestamp,
         DeviceName,
-        AccountName                  = InitiatingProcessAccountName,
+        AccountName                 = InitiatingProcessAccountName,
         AccountNameLower             = tolower(InitiatingProcessAccountName),
         ActionType,
         SmartScreenTrigger,
@@ -55,8 +46,6 @@ let Warnings = DeviceEvents
         ActivityId,
         InitiatingProcessFileName,
         InitiatingProcessCommandLine;
-// ── BLOCO 4: Join triplo — ActivityId + DeviceName + mesma conta ──────────────
-// Critério 2: OverrideAccountName == AccountNameLower do warning
 Warnings
 | join kind=leftouter ValidOverrides on DeviceName, ActivityId
 | extend SecondsToOverride = iff(
@@ -64,77 +53,30 @@ Warnings
     tolong(datetime_diff("second", OverrideTimestamp, Timestamp)),
     long(null)
 )
-// Critério 1+2+3: override existe, mesma conta, janela humana
 | extend ClickConfirmed =
     isnotempty(OverrideTimestamp)
-    and AccountNameLower == OverrideAccountName          // critério 2: mesma conta
-    and SecondsToOverride > 0                            // critério 3a: não negativo
-    and SecondsToOverride >= MinSeconds                  // critério 3b: mínimo humano
-    and SecondsToOverride <= MaxSeconds                  // critério 3c: máximo humano
-// Razão do Not-Clicked — útil para investigação
-| extend NotClickedReason = case(
-    isempty(OverrideTimestamp),
-        "No override event found",
-    SecondsToOverride <= 0,
-        "Override predates warning (session cache)",
-    SecondsToOverride < MinSeconds,
-        "Override too fast (< 3s) — automated",
-    SecondsToOverride > MaxSeconds,
-        "Override too late (> 180s) — cache/re-trigger",
-    AccountNameLower != OverrideAccountName,
-        strcat("Different account clicked: ", OverrideAccountName),
-    "Unknown"
-)
-| extend NotClickedReason = iff(ClickConfirmed, "", NotClickedReason)
-| project-away AccountNameLower, OverrideAccountName
-// ── AGREGAÇÃO FINAL por conta + trigger ──────────────────────────────────────
+    and AccountNameLower == OverrideAccountName
+    and SecondsToOverride >= MinSeconds
+    and SecondsToOverride <= MaxSeconds
 | summarize
     FirstSeen                    = min(Timestamp),
     LastSeen                     = max(Timestamp),
     Recurrences                  = count(),
-    Status                       = iff(countif(ClickConfirmed) > 0,
-                                       "Clicked", "Not-Clicked"),
+    Status                       = iff(countif(ClickConfirmed) > 0, "Clicked", "Not-Clicked"),
     ClickedCount                 = countif(ClickConfirmed),
-    // Detalhes do clique confirmado
     ClickedAt                    = minif(OverrideTimestamp, ClickConfirmed),
     SecondsToOverride            = minif(SecondsToOverride, ClickConfirmed),
-    OverrideProcess              = take_anyif(OverrideProcess, ClickConfirmed),
-    // Razão do Not-Clicked (para debug / investigação)
-    NotClickedReason             = take_anyif(NotClickedReason,
-                                       not(ClickConfirmed) and isnotempty(NotClickedReason)),
-    // Contexto
     ActionType                   = take_any(ActionType),
     ReasonForTrigger             = take_any(ReasonForTrigger),
-    DeviceName                   = take_any(DeviceName),
-    InitiatingProcessFileName    = take_any(InitiatingProcessFileName),
-    InitiatingProcessCommandLine = take_any(InitiatingProcessCommandLine)
+    DeviceName                   = take_any(DeviceName)
     by AccountName, SmartScreenTrigger
 | extend RiskLevel = case(
-    ReasonForTrigger == "Malicious",       "Critical",
-    ReasonForTrigger == "Phishing",        "Critical",
-    ReasonForTrigger == "TechScam",        "High",
-    ReasonForTrigger == "CustomBlockList", "High",
-    ReasonForTrigger == "Untrusted",       "Medium",
-    ReasonForTrigger == "Allowed",         "Low",
+    ReasonForTrigger in ("Malicious", "Phishing"), "Critical",
+    ReasonForTrigger in ("TechScam", "CustomBlockList"), "High",
+    ReasonForTrigger == "Untrusted", "Medium",
     "Low"
 )
 | project
-    Status,
-    RiskLevel,
-    AccountName,
-    DeviceName,
-    ActionType,
-    SmartScreenTrigger,
-    ReasonForTrigger,
-    FirstSeen,
-    LastSeen,
-    Recurrences,
-    ClickedCount,
-    ClickedAt,
-    SecondsToOverride,
-    OverrideProcess,
-    // Mostra por que não foi classificado como Clicked — vazio quando Clicked
-    NotClickedReason,
-    InitiatingProcessFileName,
-    InitiatingProcessCommandLine
-| order by RiskLevel asc, Status asc, Recurrences desc
+    Status, RiskLevel, AccountName, DeviceName, ActionType, SmartScreenTrigger, ReasonForTrigger, 
+    FirstSeen, LastSeen, Recurrences, ClickedCount, ClickedAt, SecondsToOverride
+| order by RiskLevel asc, Status asc
