@@ -1,0 +1,70 @@
+let Users = IdentityInfo
+| summarize arg_max(Timestamp, *) by AccountObjectId
+| where Type == 'User'
+| where IsAccountEnabled == '1'
+| where AccountUpn contains '@corp-domain.com'
+| project
+    AccountObjectId,
+    AccountUpn,
+    AccountDisplayName,
+    Department,
+    JobTitle,
+    Country,
+    Manager,
+    RiskLevel;
+let MFAUsers = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where LogonType != 'nonInteractiveUser'
+| where ErrorCode == 0
+| where AuthenticationRequirement contains 'multi'
+| summarize LastLogon = max(Timestamp) by AccountObjectId;
+let SingleFactorUsers = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where LogonType != 'nonInteractiveUser'
+| where ErrorCode == 0
+| where AuthenticationRequirement contains 'single'
+| summarize LastSingleFactorSignin = max(Timestamp) by AccountObjectId;
+let SigninInfo = AADSignInEventsBeta
+| where Timestamp > ago(30d)
+| where ErrorCode == 0
+| summarize
+    LastSigninCountry = arg_max(Timestamp, Country)
+by AccountObjectId;
+Users
+| join kind=leftouter MFAUsers on AccountObjectId
+| join kind=leftouter SingleFactorUsers on AccountObjectId
+| join kind=leftouter SigninInfo on AccountObjectId
+| extend MfaStatus = iff(isnotempty(LastLogon), 'Observed', 'Not Observed')
+| extend LastMFALogon = iff(isempty(LastLogon), datetime(null), LastLogon)
+| extend LastSingleFactorSignin = iff(isempty(LastSingleFactorSignin), datetime(null), LastSingleFactorSignin)
+| extend DaysSinceLastLogon = iff(isnull(LastLogon), int(null), datetime_diff('day', now(), LastLogon))
+| extend DaysSinceLastSingleFactorSignin = iff(isnull(LastSingleFactorSignin), int(null), datetime_diff('day', now(), LastSingleFactorSignin))
+| extend PrivilegedUser =
+    iff(AccountUpn contains 'admin.'
+        or AccountUpn contains 'admin-'
+        or AccountUpn contains 'adm-'
+        or AccountUpn contains 'adm.'
+        or AccountDisplayName contains 'admin-'
+        or AccountDisplayName contains 'admin.'
+        or AccountDisplayName contains 'adm-'
+        or AccountDisplayName contains 'adm.'
+        'Likely',
+        'No'
+    )
+| extend RiskLevel = iff(isempty(RiskLevel), 'None', RiskLevel)
+| project
+    MfaStatus,
+    LastMFALogon,
+    DaysSinceLastLogon,
+    LastSingleFactorSignin,
+    DaysSinceLastSingleFactorSignin,
+    AccountUpn,
+    AccountDisplayName,
+    JobTitle,
+    Department,
+    Country,
+    LastSigninCountry,
+    Manager,
+    PrivilegedUser,
+    RiskLevel
+| order by Department asc
